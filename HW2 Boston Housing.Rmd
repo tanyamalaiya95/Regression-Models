@@ -1,0 +1,302 @@
+---
+title: 'HW 2: Boston Housing Data'
+output:
+  word_document: default
+  html_document:
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+## Data
+The data being used for regression modeling is the _Boston Housing Dataset_ from the MASS package in R. This data consists of 506 observations and 14 variables. The resultant variable to be predicted is "medv", i.e. the median value of owner-occupied homes in $1000s. This resultant variable is present in the 14th column of the dataset.
+
+## Goal and Background
+The objective of this analysis is to fit different predictive models onto the training and testing subsets of the dataset and evaluate the in-sample and out-of-sample performance of each model. The following models' performances are compared: 
+
+- General Linear Model
+- Tree model - CART
+- Advanced Tree Models - Bagging, Random Forest, Boosting
+- Generalized Additive Model
+- Neural Network
+
+## Approach
+We begin the analysis by an initial exploratory data analysis to get a preliminary understanding of the relationships among the different variables. The data is then split into 70% training data set and 30% testing data set (seed is set to 13480226 to facilitate reproducibility). 
+For linear regression model, we select variables using backward elimination with AIC as criterion, and for all the other models we assume a full model. Finally, we calculate and compare the different models' performances - the metrics used to assess the training and testing errors are *MSE* and *MSPE* respectively.
+
+## Initial Data Exploration
+From an inital exploratory analysis, we note that all variables are in numeric/integer format, and that the resultant variable "medv" has the highest correlation with the variables "lstat" (positively correlated), and "rm" (negatively correlated)
+
+```{r, include = FALSE}
+set.seed(13480226)
+#Loading data
+require(MASS)
+require(rms)
+require(rpart)
+require(rpart.plot)
+require(ipred)
+require(randomForest)
+require(gbm)
+require(corrplot)
+require(dplyr)
+require(ggplot2)
+require(mgcv)
+require(neuralnet)
+
+data("Boston")
+
+#Data Splitting: 70% training data
+index <- sample(nrow(Boston),nrow(Boston)*0.70)
+boston.train <- Boston[index,]
+boston.test <- Boston[-index,]
+
+#IDA
+str(Boston)
+Boston %>%
+  cor() %>%
+  corrplot()
+```
+
+## Linear regression model
+StepAIC is used for variable selection that is fitted onto the training data, and VIFs are checked for the chosen predictor variables to ensure collinearity is eliminated. The output of the final model are as below: 
+```{r, include = F, warning = F}
+model_full<- glm(medv~., data=boston.train)
+stepAIC(model_full)
+mod0<-glm(medv~.-indus-age, data=boston.train)
+```
+
+```{r, warning=F}
+summary(mod0)
+round(vif(mod0),2)
+```
+
+The in-sample and out-of-sample performance of the model are:
+```{r, echo = F, warning=F}
+#Training error
+paste("GLM: MSE = ",round(mean(mod0$residual^2),2))
+
+#Testing error
+boston.mod.pred<- predict(mod0, newdata = boston.test)
+paste("GLM: MSPE = ",round(mean((boston.test$medv-boston.mod.pred)^2),2))
+```
+
+## Decision Tree - CART
+For this data set, since the respondent variable _medv_ is a numerical variable, we build regression tree, and calculate the MSE and MSPE.
+```{r, echo = F, warning=F}
+#Model fitting
+boston.tree<- rpart(medv~., data = boston.train)
+rpart.plot(boston.tree)
+
+#In-sample Prediction
+boston.train.pred.tree = predict(boston.tree, newdata = boston.train)
+#Out-of-sample Prediction
+boston.test.pred.tree = predict(boston.tree, newdata = boston.test)
+
+#Output results
+paste("Decision Tree: MSE = ",round(mean((boston.train$medv-boston.train.pred.tree)^2),2))
+paste("Decision Tree: MSPE = ",round(mean((boston.test$medv-boston.test.pred.tree)^2),2))
+```
+
+## Bagging
+For Bagging algorithm, we first calculate the optimal tree count to minimize testing error. The model is build using the obtained parameter and fitted on the training data. In addition to training and testing errors, we also calculate the Out-of-bag prediction error for a bootstrap count of 100.
+```{r, echo = F, warning=F}
+#Assessing optimal tree counts
+ntree<- c(seq(1,100))
+MSE.test<- rep(0, length(ntree))
+for(i in 1:length(ntree)){
+  boston.bag1<- bagging(medv~., data = boston.train, nbagg=ntree[i])
+  boston.bag.pred1<- predict(boston.bag1, newdata = boston.test)
+  MSE.test[i]<- mean((boston.test$medv-boston.bag.pred1)^2)
+}
+
+#Model fitting
+boston.bag<- bagging(medv~., data = boston.train, nbagg = ntree[which(MSE.test==min(MSE.test))])
+
+#In-sample Prediction
+boston.train.pred.bag = predict(boston.bag, newdata = boston.train)
+#Out-of-sample Prediction
+boston.test.pred.bag = predict(boston.bag, newdata = boston.test)
+
+#Output results
+paste("Bagging: Optimal no. of trees = ", ntree[which(MSE.test==min(MSE.test))])
+paste("Bagging: MSE = ",round(mean((boston.train$medv-boston.train.pred.bag)^2),2))
+paste("Bagging: MSPE = ",round(mean((boston.test$medv-boston.test.pred.bag)^2),2))
+
+#OOB Prediction error
+boston.bag.oob<- bagging(medv~., data = boston.train, coob=T, nbagg=100)
+paste("Bagging: OOB MSE = ",round(boston.bag.oob$err,2))
+```
+
+## Random Forest
+Random Forest provides a better prediction than any of the above methods. It randomly selects 4 out of the 13 predictor variables for each split in each tree in order to reduce the overall variance of the aggregate. 
+By default, the model selects 13/3 = 4 variables at each split, and includes 500 trees. However, we alter these parameters to minimize the OOB error, and assess the model obtained thereby.
+We note that 4 is not the ideal variable count, and higher complexity (ntree=500) doesn't yield the best performance.
+```{r, echo = F, warning=F}
+#Model fitting
+boston.rfa<- randomForest(medv~., data = boston.train, importance=TRUE)
+
+#Optimal variable count
+oob.err<- rep(0, 13)
+for(i in 1:13){
+  fit<- randomForest(medv~., data = boston.train, mtry=i)
+  nb_tree <- which(fit$mse==min(fit$mse))
+  oob.err[i]<- fit$mse[nb_tree]
+}
+
+nb_tree <- which(boston.rfa$mse==min(boston.rfa$mse))
+m_count <- which(oob.err==min(oob.err))
+
+#Re-fitting with optimal parameters
+boston.rf<- randomForest(medv~., data = boston.train, importance=TRUE, mtry=m_count, ntree = nb_tree)
+
+#In-sample Prediction
+boston.train.pred.rf = predict(boston.rf, newdata = boston.train)
+#Out-of-sample Prediction
+boston.test.pred.rf = predict(boston.rf, newdata = boston.test)
+
+#Output results
+paste("Optimum tree count = ", nb_tree)
+paste("Optimum variable count = ", m_count)
+paste("Random Forest: MSE = ",round(mean((boston.train$medv-boston.train.pred.rf)^2),2))
+paste("Random Forest: MSPE = ",round(mean((boston.test$medv-boston.test.pred.rf)^2),2))
+
+#Plots
+par(mfrow=c(1,2))
+plot(boston.rfa$mse, type='l', lwd=2, xlab = "ntree", ylab = "OOB Error")
+plot(oob.err, type = "b", ylab = "OOB Error", xlab = "mtry")
+```
+
+## Boosting
+Boosting is a slow learning method which builds a large number of small trees where responses are the residuals of previous trees. There are many tuning parameters that can be controlled. This model chooses them as follows: 
+We set the distribution to be "gaussian" because this is a regression model, shrinkage parameter to be 0.01, include 10000 trees in the training model, and set a maximum level of variable interactions as 8.  
+```{r, echo = F, warning=F}
+#Model fitting
+boston.boost<- gbm(medv~., data = boston.train, distribution = "gaussian", n.trees = 10000, shrinkage = 0.01, interaction.depth = 8)
+
+#In-sample Prediction
+boston.train.pred.boost = predict(boston.boost, newdata = boston.train, n.trees = 10000)
+#Out-of-sample Prediction
+boston.test.pred.boost = predict(boston.boost, newdata = boston.test, n.trees = 10000)
+
+#Output results
+paste("Boosting: MSE = ",round(mean((boston.train$medv-boston.train.pred.boost)^2),2))
+paste("Boosting: MSPE = ",round(mean((boston.test$medv-boston.test.pred.boost)^2),2))
+```
+
+## General Additive Model
+The predictor variable for this data is a numerical, as are all of the other variables except 'chas', which is a binary variable. For the initial model, we apply smooth spline function 's' from package 'mgcv' to all variables except 'chas' and 'rad'
+
+```{r, echo=F, message=F}
+#Model fitting
+gam_formula <- as.formula(medv ~ s(crim) + 
+                            s(zn) + 
+                            s(indus) +
+                            chas +
+                            s(nox) + 
+                            s(rm) + 
+                            s(age) +
+                            s(dis) + 
+                            rad + 
+                            s(tax) + 
+                            s(ptratio) + 
+                            s(black) + 
+                            s(lstat))
+
+boston.gam <- gam(gam_formula, family = gaussian, data = boston.train)
+summary(boston.gam)
+```
+The model indicates that variables 'zn' and 'age' are not significant predictors at an alpha level of 0.5. Additionally, the edf (effective degrees of freedom) indicates that variables 'zn', 'age', and 'ptratio' have a linear relationship with the resultant variable. Higher edf vaues indicate a more "wiggly" curve estimate, as can be seen in the plots. Additionally, the p-value component indicates whether the term is significant or not as a whole for the model.
+
+Based on the observed data, we draw the following conclusions about each variable term:
+
+- crim: non-linear, significant 
+- zn: linear, insignificant
+- indus: non-linear, significant
+- chas: linear, significant
+- nox: non-linear, significant
+- rm: non-linear, significant
+- age: linear, insignificant
+- dis: non-linear, significant
+- rad: linear, significant
+- tax: non-linear, significant
+- ptratio: non-linear, significant
+- black: non-linear, significant
+- lstat: non-linear, significant
+
+Based on the above findings, we adjust the model prior to training and prediction. The outcomes of the final model as as below: 
+```{r, echo=F, message=F, warning=F}
+gam_formula <- as.formula(medv ~ s(crim) + 
+                            zn + 
+                            s(indus) +
+                            chas +
+                            s(nox) + 
+                            s(rm) + 
+                            age +
+                            s(dis) + 
+                            rad + 
+                            s(tax) + 
+                            ptratio + 
+                            s(black) + 
+                            s(lstat))
+
+boston.gam <- gam(gam_formula, family = gaussian, data = boston.train)
+summary(boston.gam)
+plot(boston.gam, shade=TRUE, seWithMean=TRUE, scale=0, pages = 1)
+
+#In-sample Prediction
+boston.train.pred.gam = predict(boston.gam, newdata = boston.train)
+#Out-of-sample Prediction
+boston.test.pred.gam = predict(boston.gam, newdata = boston.test)
+```
+
+Finally, we calculate the in-sample and out-of-sample performance of this model.
+```{r, echo=F, message=F}
+#Output results
+paste("GAM: MSE = ",round(mean((boston.train$medv-boston.train.pred.gam)^2),2))
+paste("GAM: MSPE = ",round(mean((boston.test$medv-boston.test.pred.gam)^2),2))
+```
+
+## Neural Networks
+A typical neural network is a layered architrecture of linear regression models. The input layer consists of all the predictor variables, and each component in the successive hidden layer is a weighted output of the combinations of components from the previous layer. Due to the complexity of this model, it trades off high predictive accuracy for poor interpretability, and is often termed as a "black box" model.
+
+In order to ensure that the model converges, we standardize all the variables in the data set to a scale of [0,1] using the min-max method. We then use the scaled data frame to split into 70% training and 30% testing data.
+
+We configure 2 hidden layers for this model, the first one with 5 nodes and the second with 3 nodes, enabling the linear output for training purposes.
+```{r, echo=F}
+#Standardization
+maxs <- apply(Boston, 2, max) 
+mins <- apply(Boston, 2, min)
+scaled <- as.data.frame(scale(Boston, center = mins, scale = maxs - mins))
+
+#Splitting data
+index <- sample(1:nrow(Boston),round(0.75*nrow(Boston)))
+train_ <- scaled[index,]
+test_ <- scaled[-index,]
+
+n <- names(train_)
+f <- as.formula(paste("medv ~", paste(n[!n %in% "medv"], collapse = " + ")))
+
+#Model fitting
+nn <- neuralnet(f,data=train_,hidden=c(5,3),linear.output=T) #"hidden" configures hidden layers
+
+#Prediction
+boston.predict.train.nn <- predict(nn,newdata=train_[,1:13])
+boston.predict.test.nn <- predict(nn,newdata=test_[,1:13])
+
+#Transforming back to original scale
+pr.nn.train<- boston.predict.train.nn*(max(Boston$medv)-min(Boston$medv))+min(Boston$medv)
+train.r <- (train_$medv)*(max(Boston$medv)-min(Boston$medv))+min(Boston$medv)
+
+pr.nn.test<- boston.predict.test.nn*(max(Boston$medv)-min(Boston$medv))+min(Boston$medv)
+test.r <- (test_$medv)*(max(Boston$medv)-min(Boston$medv))+min(Boston$medv)
+
+# MSE of testing set
+MSE.nn <- sum((train.r - pr.nn.train)^2)/nrow(train_)
+MSPE.nn <- sum((test.r - pr.nn.test)^2)/nrow(test_)
+
+#Output results
+paste("NN: MSE = ",round(MSE.nn,2))
+paste("NN: MSPE = ",round(MSPE.nn,2))
+plot(nn)
+```
